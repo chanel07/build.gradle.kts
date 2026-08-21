@@ -3,73 +3,64 @@ package com.blutu.app
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanResult
-import android.content.Intent
+import android.bluetooth.le.AdvertiseCallback
+import android.bluetooth.le.AdvertiseData
+import android.bluetooth.le.AdvertiseSettings
+import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
+import android.os.ParcelUuid
 import android.view.Gravity
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import java.util.UUID
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var statusText: TextView
-    private lateinit var deviceListContainer: LinearLayout
+    private lateinit var detailText: TextView
 
     private var bluetoothAdapter: BluetoothAdapter? = null
-    private var scanning = false
+    private var advertiser: BluetoothLeAdvertiser? = null
 
-    private data class DeviceInfo(
-        val name: String,
-        val address: String,
-        var rssi: Int,
-        var lastSeen: Long
+    // UUID de prueba Blutu. En la app real este identifica una baliza Blutu.
+    private val blutuServiceUuid = ParcelUuid(
+        UUID.fromString("0000b101-0000-1000-8000-00805f9b34fb")
     )
 
-    private val devices = HashMap<String, DeviceInfo>()
-    private val deviceViews = HashMap<String, TextView>()
-
-    private val refreshHandler = Handler(Looper.getMainLooper())
-    private val refreshIntervalMs = 1000L
-
-    private val refreshRunnable = object : Runnable {
-        override fun run() {
-            cleanupStaleDevices()
-            renderDeviceList()
-            refreshHandler.postDelayed(this, refreshIntervalMs)
-        }
-    }
-
-    private val scanCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult) {
-            val address = result.device.address ?: return
-            val name = try {
-                result.device.name ?: result.scanRecord?.deviceName ?: "Desconocido"
-            } catch (e: SecurityException) {
-                "Desconocido"
-            }
-            val existing = devices[address]
-            if (existing != null) {
-                existing.rssi = result.rssi
-                existing.lastSeen = System.currentTimeMillis()
-            } else {
-                devices[address] = DeviceInfo(name, address, result.rssi, System.currentTimeMillis())
-            }
-        }
-
-        override fun onScanFailed(errorCode: Int) {
-            scanning = false
+    private val advertiseCallback = object : AdvertiseCallback() {
+        override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
             runOnUiThread {
-                statusText.text = "Error al escanear (código $errorCode)"
+                statusText.text = "✓ Tu celular PUEDE transmitir"
+                statusText.setTextColor(Color.parseColor("#1B7F3B"))
+                detailText.text = "Transmitiendo baliza de prueba Blutu.\n\n" +
+                        "Abre otra app BLE (como nRF Connect) en otro " +
+                        "celular y busca un dispositivo con este UUID:\n\n" +
+                        "0000b101-...-34fb\n\n" +
+                        "Si lo ves, el modo VÍCTIMA funciona en este equipo."
+            }
+        }
+
+        override fun onStartFailure(errorCode: Int) {
+            val reason = when (errorCode) {
+                ADVERTISE_FAILED_DATA_TOO_LARGE -> "Los datos son muy grandes"
+                ADVERTISE_FAILED_TOO_MANY_ADVERTISERS -> "Demasiadas transmisiones activas"
+                ADVERTISE_FAILED_ALREADY_STARTED -> "Ya estaba transmitiendo"
+                ADVERTISE_FAILED_INTERNAL_ERROR -> "Error interno"
+                ADVERTISE_FAILED_FEATURE_UNSUPPORTED -> "El hardware NO soporta transmitir"
+                else -> "Error desconocido ($errorCode)"
+            }
+            runOnUiThread {
+                statusText.text = "✗ No pudo transmitir"
+                statusText.setTextColor(Color.parseColor("#B00020"))
+                detailText.text = "Motivo: $reason\n\n" +
+                        "Este celular quizás solo sirva como RESCATISTA " +
+                        "(buscar), no como víctima (pedir ayuda)."
             }
         }
     }
@@ -78,19 +69,10 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
         if (results.values.all { it }) {
-            checkBluetoothEnabledAndScan()
+            tryAdvertise()
         } else {
-            statusText.text = "Permisos denegados. Blutu necesita Bluetooth para funcionar."
-        }
-    }
-
-    private val enableBtLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) {
-        if (bluetoothAdapter?.isEnabled == true) {
-            startScanning()
-        } else {
-            statusText.text = "Bluetooth desactivado. Actívalo para escanear."
+            statusText.text = "Permisos denegados"
+            detailText.text = "Blutu necesita permiso de Bluetooth para probar."
         }
     }
 
@@ -98,65 +80,82 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         buildUi()
 
-        val bluetoothManager = getSystemService(BluetoothManager::class.java)
-        bluetoothAdapter = bluetoothManager.adapter
+        val manager = getSystemService(BluetoothManager::class.java)
+        bluetoothAdapter = manager.adapter
 
-        if (bluetoothAdapter == null) {
-            statusText.text = "Este dispositivo no tiene Bluetooth."
+        val adapter = bluetoothAdapter
+        if (adapter == null) {
+            statusText.text = "✗ Sin Bluetooth"
+            detailText.text = "Este dispositivo no tiene Bluetooth."
             return
         }
 
-        requestNeededPermissions()
+        if (!adapter.isEnabled) {
+            statusText.text = "Bluetooth apagado"
+            detailText.text = "Activa el Bluetooth y vuelve a abrir la app."
+            return
+        }
+
+        // Chequeo de capacidad ANTES de intentar transmitir
+        if (!adapter.isMultipleAdvertisementSupported) {
+            statusText.text = "✗ Hardware sin soporte de transmisión"
+            statusText.setTextColor(Color.parseColor("#B00020"))
+            detailText.text = "Este celular NO puede transmitir balizas BLE.\n\n" +
+                    "Solo podrá funcionar como RESCATISTA (buscar), " +
+                    "no como víctima (pedir ayuda)."
+            return
+        }
+
+        requestPermissionsAndAdvertise()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        stopScanning()
-        refreshHandler.removeCallbacks(refreshRunnable)
+        try {
+            advertiser?.stopAdvertising(advertiseCallback)
+        } catch (e: SecurityException) {
+            // permiso revocado, ignorar
+        }
     }
 
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(32, 64, 32, 32)
+            gravity = Gravity.CENTER
+            setPadding(48, 48, 48, 48)
         }
 
         val title = TextView(this).apply {
-            text = "Blutu"
-            textSize = 28f
+            text = "Blutu — Prueba de transmisión"
+            textSize = 22f
             gravity = Gravity.CENTER
+            setPadding(0, 0, 0, 32)
         }
 
         statusText = TextView(this).apply {
-            text = "Iniciando..."
-            textSize = 16f
+            text = "Probando..."
+            textSize = 20f
             gravity = Gravity.CENTER
-            setPadding(0, 16, 0, 24)
+            setPadding(0, 0, 0, 24)
         }
 
-        deviceListContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-
-        val scrollView = ScrollView(this).apply {
-            addView(deviceListContainer)
+        detailText = TextView(this).apply {
+            text = ""
+            textSize = 15f
+            gravity = Gravity.CENTER
         }
 
         root.addView(title)
         root.addView(statusText)
-        root.addView(
-            scrollView,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
-        )
-
+        root.addView(detailText)
         setContentView(root)
     }
 
-    private fun requestNeededPermissions() {
+    private fun requestPermissionsAndAdvertise() {
         val needed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+            arrayOf(Manifest.permission.BLUETOOTH_ADVERTISE)
         } else {
-            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+            arrayOf() // en versiones viejas el permiso es de manifest, no runtime
         }
 
         val missing = needed.filter {
@@ -164,94 +163,40 @@ class MainActivity : ComponentActivity() {
         }
 
         if (missing.isEmpty()) {
-            checkBluetoothEnabledAndScan()
+            tryAdvertise()
         } else {
             permissionLauncher.launch(missing.toTypedArray())
         }
     }
 
-    private fun checkBluetoothEnabledAndScan() {
+    private fun tryAdvertise() {
         val adapter = bluetoothAdapter ?: return
-        if (adapter.isEnabled) {
-            startScanning()
-        } else {
-            try {
-                enableBtLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
-            } catch (e: SecurityException) {
-                statusText.text = "No se pudo pedir activar Bluetooth."
-            }
-        }
-    }
+        advertiser = adapter.bluetoothLeAdvertiser
 
-    private fun startScanning() {
-        if (scanning) return
-        val scanner = bluetoothAdapter?.bluetoothLeScanner
-        if (scanner == null) {
-            statusText.text = "No se pudo iniciar el escáner BLE."
+        if (advertiser == null) {
+            statusText.text = "✗ Sin transmisor BLE"
+            detailText.text = "El sistema no entregó un transmisor. " +
+                    "Probablemente este celular no puede transmitir."
             return
         }
+
+        val settings = AdvertiseSettings.Builder()
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
+            .setConnectable(false)
+            .build()
+
+        val data = AdvertiseData.Builder()
+            .setIncludeDeviceName(false)
+            .addServiceUuid(blutuServiceUuid)
+            .build()
+
         try {
-            scanner.startScan(scanCallback)
-            scanning = true
-            statusText.text = "Buscando dispositivos..."
-            refreshHandler.post(refreshRunnable)
+            advertiser?.startAdvertising(settings, data, advertiseCallback)
+            statusText.text = "Iniciando transmisión..."
         } catch (e: SecurityException) {
-            statusText.text = "Falta permiso de Bluetooth."
-        }
-    }
-
-    private fun stopScanning() {
-        if (!scanning) return
-        try {
-            bluetoothAdapter?.bluetoothLeScanner?.stopScan(scanCallback)
-        } catch (e: SecurityException) {
-            // permiso ya revocado, ignorar
-        }
-        scanning = false
-    }
-
-    private fun cleanupStaleDevices() {
-        val now = System.currentTimeMillis()
-        val staleAfterMs = 15000L
-        val staleAddresses = devices.filter { now - it.value.lastSeen > staleAfterMs }.keys
-        for (address in staleAddresses) {
-            devices.remove(address)
-            deviceViews.remove(address)?.let { view -> deviceListContainer.removeView(view) }
-        }
-    }
-
-    private fun renderDeviceList() {
-        val sorted = devices.values.sortedByDescending { it.rssi }
-
-        statusText.text = if (sorted.isEmpty()) {
-            "Buscando dispositivos..."
-        } else {
-            "${sorted.size} dispositivo(s) cerca"
-        }
-
-        for ((index, info) in sorted.withIndex()) {
-            val label = "${info.name}\n${info.address}  ·  ${info.rssi} dBm"
-            val existingView = deviceViews[info.address]
-            if (existingView != null) {
-                existingView.text = label
-                deviceListContainer.removeView(existingView)
-                deviceListContainer.addView(existingView, index)
-            } else {
-                val newView = TextView(this).apply {
-                    text = label
-                    textSize = 15f
-                    setPadding(16, 20, 16, 20)
-                    setBackgroundColor(Color.parseColor("#F0F0F0"))
-                }
-                val params = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                )
-                params.setMargins(0, 0, 0, 8)
-                newView.layoutParams = params
-                deviceViews[info.address] = newView
-                deviceListContainer.addView(newView, index)
-            }
+            statusText.text = "✗ Falta permiso"
+            detailText.text = "No se pudo transmitir por falta de permiso."
         }
     }
 }
